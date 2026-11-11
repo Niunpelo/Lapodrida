@@ -1,0 +1,75 @@
+name: Compilar APK
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Localizar el proyecto
+        id: proj
+        run: |
+          F=$(find . -maxdepth 3 -name pubspec.yaml -exec grep -l '^name: la_podrida' {} + | head -n 1)
+          if [ -z "$F" ] || ! grep -q PodridaApp "$(dirname "$F")/lib/main.dart" 2>/dev/null; then
+            echo "::error::No encuentro el código de La Podrida. Faltan pubspec.yaml y la carpeta lib/ (con main.dart) en el repositorio."
+            exit 1
+          fi
+          DIR=$(dirname "$F")
+          echo "Proyecto en: $DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Instalar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Instalar Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generar proyecto Android
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: flutter create --platforms=android --project-name la_podrida --org es.lapodrida .
+
+      - name: Poner nombre a la app
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: sed -i 's/android:label="[^"]*"/android:label="La Podrida"/' android/app/src/main/AndroidManifest.xml
+
+      - name: Descargar dependencias
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: flutter pub get
+
+      - name: Compilar APK
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: flutter build apk --release
+
+      - name: Renombrar APK
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: cp build/app/outputs/flutter-apk/app-release.apk la-podrida.apk
+
+      - name: Guardar APK como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: la-podrida-apk
+          path: ${{ steps.proj.outputs.dir }}/la-podrida.apk
+
+      - name: Publicar en Releases
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.proj.outputs.dir }}/la-podrida.apk

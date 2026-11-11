@@ -6,6 +6,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'groups.dart';
+
 enum Phase { bidding, results }
 
 const Map<int, String> decks = {
@@ -18,7 +20,7 @@ int maxCardsFor(int players, int deckSize) {
   return m < 1 ? 1 : m;
 }
 
-int totalRoundsFor(int maxCards) => 2 * maxCards - 1;
+int totalRoundsFor(int maxCards) => 2 * maxCards;
 
 int roundPoints(int bid, int won) {
   if (bid == won) return 10 + 3 * bid;
@@ -45,11 +47,14 @@ class Game {
     required this.deckSize,
     required this.maxCards,
     required this.firstDealer,
+    this.groupId,
+    String? gameId,
     List<RoundRecord>? rounds,
     List<int>? bids,
     List<int>? won,
     this.phase = Phase.bidding,
-  })  : rounds = rounds ?? <RoundRecord>[],
+  })  : gameId = gameId ?? DateTime.now().microsecondsSinceEpoch.toString(),
+        rounds = rounds ?? <RoundRecord>[],
         bids = bids ?? List<int>.filled(players.length, 0),
         won = won ?? List<int>.filled(players.length, 0);
 
@@ -57,6 +62,9 @@ class Game {
   final int deckSize;
   final int maxCards;
   final int firstDealer;
+
+  final String? groupId;
+  final String gameId;
 
   final List<RoundRecord> rounds;
 
@@ -69,16 +77,15 @@ class Game {
   int get roundIndex => rounds.length;
   bool get finished => rounds.length >= totalRounds;
 
-  int cardsForRound(int i) => i < maxCards ? i + 1 : 2 * maxCards - 1 - i;
+  int cardsForRound(int i) => i < maxCards ? i + 1 : 2 * maxCards - i;
 
   int get cards => cardsForRound(roundIndex);
 
   bool get allCardsDealt => cards * n == deckSize;
 
   String get roundKind {
-    final i = roundIndex;
-    if (i == maxCards - 1) return 'Ronda máxima';
-    return i < maxCards - 1 ? 'Subida' : 'Bajada';
+    final base = roundIndex < maxCards ? 'Subida' : 'Bajada';
+    return cards == maxCards ? '$base · máxima' : base;
   }
 
   int get dealer => (firstDealer + roundIndex) % n;
@@ -98,16 +105,6 @@ class Game {
   int get bidSum => bids.fold(0, (a, b) => a + b);
   int get wonSum => won.fold(0, (a, b) => a + b);
 
-  int? get forbiddenForDealer {
-    var sum = 0;
-    for (var i = 0; i < n; i++) {
-      if (i != dealer) sum += bids[i];
-    }
-    final f = cards - sum;
-    return (f >= 0 && f <= cards) ? f : null;
-  }
-
-  bool get bidsValid => forbiddenForDealer != bids[dealer];
   bool get resultsValid => wonSum == cards;
 
   void confirmBids() {
@@ -138,6 +135,8 @@ class Game {
         'deckSize': deckSize,
         'maxCards': maxCards,
         'firstDealer': firstDealer,
+        'groupId': groupId,
+        'gameId': gameId,
         'rounds': rounds.map((r) => r.toJson()).toList(),
         'bids': bids,
         'won': won,
@@ -149,6 +148,8 @@ class Game {
         deckSize: j['deckSize'] as int,
         maxCards: j['maxCards'] as int,
         firstDealer: j['firstDealer'] as int,
+        groupId: j['groupId'] as String?,
+        gameId: j['gameId'] as String?,
         rounds: (j['rounds'] as List)
             .map((e) => RoundRecord.fromJson(e as Map<String, dynamic>))
             .toList(),
@@ -186,7 +187,28 @@ class GameStore extends ChangeNotifier {
     if (g == null) return;
     change(g);
     _save();
+    _syncHistory(g);
     notifyListeners();
+  }
+
+  void _syncHistory(Game g) {
+    final gid = g.groupId;
+    if (gid == null) return;
+    if (g.finished) {
+      groupStore.upsertGame(
+        gid,
+        GameRecord(
+          id: g.gameId,
+          date: DateTime.now(),
+          deckSize: g.deckSize,
+          rounds: g.totalRounds,
+          players: List<String>.of(g.players),
+          totals: g.totals,
+        ),
+      );
+    } else {
+      groupStore.removeGame(gid, g.gameId);
+    }
   }
 
   void clear() {
@@ -283,6 +305,12 @@ class HomeScreen extends StatelessWidget {
     );
   }
 
+  void _groups(BuildContext context) {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(builder: (_) => const GroupsScreen()),
+    );
+  }
+
   void _continue(BuildContext context) {
     Navigator.of(context).push(
       MaterialPageRoute<void>(builder: (_) => const GameScreen()),
@@ -341,6 +369,12 @@ class HomeScreen extends StatelessWidget {
                       onPressed: () => _newGame(context),
                       child: const Text('Nueva partida'),
                     ),
+                  const SizedBox(height: 12),
+                  OutlinedButton.icon(
+                    onPressed: () => _groups(context),
+                    icon: const Icon(Icons.groups_outlined),
+                    label: const Text('Grupos'),
+                  ),
                 ],
               );
             },
@@ -352,14 +386,17 @@ class HomeScreen extends StatelessWidget {
 }
 
 class SetupScreen extends StatefulWidget {
-  const SetupScreen({super.key});
+  const SetupScreen({super.key, this.fixedPlayers, this.groupId});
+
+  final List<String>? fixedPlayers;
+  final String? groupId;
 
   @override
   State<SetupScreen> createState() => _SetupScreenState();
 }
 
 class _SetupScreenState extends State<SetupScreen> {
-  int _players = 4;
+  late int _players = widget.fixedPlayers?.length ?? 4;
   int _deck = 48;
   int? _maxOverride;
 
@@ -399,15 +436,16 @@ class _SetupScreenState extends State<SetupScreen> {
                             style: t.textTheme.headlineSmall,
                           ),
                         ),
-                        NumberStepper(
-                          value: _players,
-                          min: 3,
-                          max: 10,
-                          onChanged: (v) => setState(() {
-                            _players = v;
-                            _maxOverride = null;
-                          }),
-                        ),
+                        if (widget.fixedPlayers == null)
+                          NumberStepper(
+                            value: _players,
+                            min: 3,
+                            max: 10,
+                            onChanged: (v) => setState(() {
+                              _players = v;
+                              _maxOverride = null;
+                            }),
+                          ),
                       ],
                     ),
                     const SizedBox(height: 32),
@@ -444,7 +482,7 @@ class _SetupScreenState extends State<SetupScreen> {
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            '$maxC de subida y ${maxC - 1} de bajada\n'
+                            '$maxC de subida y $maxC de bajada\n'
                             'De 1 a $maxC cartas por jugador',
                             style: t.textTheme.bodyMedium
                                 ?.copyWith(color: cs.onSurfaceVariant),
@@ -477,6 +515,8 @@ class _SetupScreenState extends State<SetupScreen> {
                         players: _players,
                         deckSize: _deck,
                         maxCards: maxC,
+                        initialNames: widget.fixedPlayers,
+                        groupId: widget.groupId,
                       ),
                     ),
                   );
@@ -516,11 +556,16 @@ class NamesScreen extends StatefulWidget {
     required this.players,
     required this.deckSize,
     required this.maxCards,
+    this.initialNames,
+    this.groupId,
   });
 
   final int players;
   final int deckSize;
   final int maxCards;
+
+  final List<String>? initialNames;
+  final String? groupId;
 
   @override
   State<NamesScreen> createState() => _NamesScreenState();
@@ -529,7 +574,11 @@ class NamesScreen extends StatefulWidget {
 class _NamesScreenState extends State<NamesScreen> {
   late final List<TextEditingController> _ctrls = List.generate(
     widget.players,
-    (_) => TextEditingController(),
+    (i) {
+      final names = widget.initialNames;
+      final text = (names != null && i < names.length) ? names[i] : '';
+      return TextEditingController(text: text);
+    },
   );
 
   int? _dealer;
@@ -586,6 +635,7 @@ class _NamesScreenState extends State<NamesScreen> {
         deckSize: widget.deckSize,
         maxCards: widget.maxCards,
         firstDealer: dealer,
+        groupId: widget.groupId,
       ),
     );
     Navigator.of(context).pushAndRemoveUntil(
@@ -761,28 +811,14 @@ class RoundView extends StatelessWidget {
 
     final List<Widget> footer;
     if (bidding) {
-      final f = g.forbiddenForDealer;
-      final bad = !g.bidsValid;
       footer = [
         Text(
           'Apuestas: ${g.bidSum} de $cards',
           style: t.textTheme.bodyMedium?.copyWith(color: cs.onSurfaceVariant),
         ),
-        if (f != null)
-          Padding(
-            padding: const EdgeInsets.only(top: 2),
-            child: Text(
-              '$dealerName reparte y no puede pedir $f',
-              style: t.textTheme.bodyMedium?.copyWith(
-                color: bad ? cs.error : cs.onSurfaceVariant,
-                fontWeight: bad ? FontWeight.w600 : FontWeight.w400,
-              ),
-            ),
-          ),
         const SizedBox(height: 12),
         FilledButton(
-          onPressed:
-              bad ? null : () => store.update((x) => x.confirmBids()),
+          onPressed: () => store.update((x) => x.confirmBids()),
           child: const Text('Empezar ronda'),
         ),
       ];
@@ -1016,6 +1052,7 @@ class FinalView extends StatelessWidget {
     ];
     final joined = winners.join(' y ');
     final title = winners.length == 1 ? 'Gana $joined' : 'Empate: $joined';
+    final group = groupStore.byId(g.groupId);
 
     int rankOf(int idx) => 1 + totals.where((x) => x > totals[idx]).length;
 
@@ -1035,6 +1072,15 @@ class FinalView extends StatelessWidget {
                 style: t.textTheme.headlineMedium
                     ?.copyWith(fontWeight: FontWeight.w700),
               ),
+              if (group != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Text(
+                    'Guardada en el historial de ${group.name}',
+                    style: t.textTheme.bodyMedium
+                        ?.copyWith(color: cs.onSurfaceVariant),
+                  ),
+                ),
               const SizedBox(height: 16),
               Expanded(
                 child: ListView(
@@ -1248,6 +1294,7 @@ class _Table extends StatelessWidget {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await groupStore.load();
   await store.load();
   runApp(const PodridaApp());
 }
